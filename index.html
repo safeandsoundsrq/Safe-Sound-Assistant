@@ -514,7 +514,7 @@
         body: JSON.stringify({ messages: history })
       });
       const data = await res.json();
-      const raw = data.content?.[0]?.text || 'Something went wrong. Please try again.';
+      const raw = data.content?.[0]?.text || 'I'm sorry, something went wrong. Please try again.';
       const booking = extractBooking(raw);
       const display = cleanText(raw);
 
@@ -528,7 +528,7 @@
       }
     } catch {
       removeTyping();
-      addMessage('assistant', 'Sorry, trouble connecting right now. Please call us or try again shortly.');
+      addMessage('assistant', 'I'm having trouble connecting right now. Please call us directly or try again shortly.');
     }
 
     sendBtn.disabled = false;
