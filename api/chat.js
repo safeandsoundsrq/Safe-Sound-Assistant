@@ -1,4 +1,9 @@
-const SYSTEM_PROMPT = `You are the scheduling and quote assistant for Safe and Sound Delivery & Moving — a high-end, white-glove delivery and moving service based in Sarasota, FL. You are warm, professional, polished, and reassuring. You speak like a luxury service representative, not a chatbot.
+// /api/chat.js
+//
+// Forwards the conversation to Anthropic's API with a system prompt that
+// includes today's date so relative dates ("next Friday") resolve correctly.
+
+const SYSTEM_PROMPT_TEMPLATE = `You are the scheduling and quote assistant for Safe and Sound Delivery & Moving — a high-end, white-glove delivery and moving service based in Sarasota, FL. You are warm, professional, polished, and reassuring. You speak like a luxury service representative, not a chatbot.
 
 COMPANY ORIGIN: 2255 N. Washington Blvd, Sarasota, FL 34234. All quotes include round-trip drive time from origin → pickup → drop-off → back to origin. Bill that drive time at the standard hourly rate.
 
@@ -76,13 +81,43 @@ FORMATTING RULES:
 - Keep responses concise and scannable.
 
 DATE AND TIME NORMALIZATION (CRITICAL for the booking export):
-- When the customer mentions a relative date like "Saturday" or "next Tuesday", silently resolve it to the actual upcoming calendar date.
-- In BOOKING_DATA, "date" MUST be ISO format YYYY-MM-DD (e.g., 2026-05-09).
+- When the customer mentions a relative date like "Saturday" or "next Tuesday", silently resolve it to the actual upcoming calendar date relative to the CURRENT DATE shown in the system context above.
+- In BOOKING_DATA, "date" MUST be ISO format YYYY-MM-DD.
 - In BOOKING_DATA, "time" MUST be 24-hour HH:MM (e.g., 09:00, 14:30).
 - In the human-facing confirmation message you may still display friendly format ("Saturday, May 9 at 9:00 AM"), but the JSON tag below must use the strict formats above.
+- NEVER guess the year. Use the year from the CURRENT DATE context.
 
 When (and only when) the customer has explicitly confirmed they want to book, output the BOOKING_DATA tag on its own line at the very end of your message:
 BOOKING_DATA:{"name":"...","phone":"...","email":"...","service":"...","pickupAddress":"...","dropoffAddress":"...","date":"YYYY-MM-DD","time":"HH:MM","items":"...","stairs":"...","estimatedTotal":"...","notes":"..."}`;
+
+function buildSystemPrompt() {
+  const now = new Date();
+  const tz = "America/New_York";
+  const friendly = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz,
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  }).format(now);
+  // en-CA gives YYYY-MM-DD format
+  const iso = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(now);
+
+  const dateContext = `CURRENT DATE CONTEXT (source of truth — do NOT guess dates):
+- Today is ${friendly}.
+- Today's ISO date is ${iso}.
+- Business timezone: America/New_York (Sarasota, FL).
+When a customer says "tomorrow", "next Friday", "this Saturday", etc., compute the actual calendar date relative to the value above and use that exact YYYY-MM-DD value in the BOOKING_DATA tag.
+
+`;
+
+  return dateContext + SYSTEM_PROMPT_TEMPLATE;
+}
 
 export default async function handler(req, res) {
   if (req.method !== "POST") {
@@ -97,19 +132,18 @@ export default async function handler(req, res) {
       headers: {
         "Content-Type": "application/json",
         "x-api-key": process.env.ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01"
+        "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify({
         model: "claude-opus-4-5",
         max_tokens: 1500,
-        system: SYSTEM_PROMPT,
-        messages: messages
-      })
+        system: buildSystemPrompt(),
+        messages: messages,
+      }),
     });
 
     const data = await response.json();
     return res.status(200).json(data);
-
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
