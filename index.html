@@ -9,16 +9,18 @@
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
     :root {
-      --gold: #c9a84c;
-      --gold-dim: rgba(201,168,76,0.18);
-      --gold-border: rgba(201,168,76,0.28);
-      --bg: #0c0b08;
-      --surface: rgba(18,15,9,0.97);
-      --text: #ede5d0;
-      --text-dim: #8a7a5a;
-      --text-muted: #4a3e28;
-      --user-bg: rgba(255,255,255,0.04);
-      --user-border: rgba(255,255,255,0.09);
+      /* Palette matched to safeandsoundsrq.com */
+      --gold: #f8d166;            /* main-site yellow CTA */
+      --gold-deep: #e0b94a;       /* slightly deeper yellow for borders/hover */
+      --gold-dim: rgba(248,209,102,0.18);
+      --gold-border: rgba(0,0,0,0.10);
+      --bg: #f3f1ef;              /* main-site cream */
+      --surface: #ffffff;         /* card white */
+      --text: #1a1a1a;            /* near-black */
+      --text-dim: #6b6359;        /* warm gray */
+      --text-muted: #9b9388;      /* light warm gray */
+      --user-bg: #f3f1ef;         /* matches site cream */
+      --user-border: rgba(0,0,0,0.08);
     }
 
     html, body {
@@ -36,21 +38,7 @@
       justify-content: center;
       min-height: 100vh;
       padding: 16px;
-      background:
-        radial-gradient(ellipse at 20% 20%, rgba(201,168,76,0.04) 0%, transparent 60%),
-        radial-gradient(ellipse at 80% 80%, rgba(120,90,20,0.05) 0%, transparent 60%),
-        #0c0b08;
-    }
-
-    /* Grain overlay */
-    body::before {
-      content: '';
-      position: fixed;
-      inset: 0;
-      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.03'/%3E%3C/svg%3E");
-      pointer-events: none;
-      z-index: 0;
-      opacity: 0.4;
+      background: var(--bg);
     }
 
     .wrapper {
@@ -75,18 +63,18 @@
     .header-eyebrow {
       font-size: 10px;
       letter-spacing: 5px;
-      color: var(--gold);
+      color: var(--gold-deep);
       text-transform: uppercase;
-      font-weight: 300;
+      font-weight: 500;
       margin-bottom: 6px;
     }
 
     .header h1 {
       font-family: 'Cormorant Garamond', serif;
       font-size: clamp(26px, 5vw, 38px);
-      font-weight: 300;
+      font-weight: 400;
       letter-spacing: 3px;
-      color: #f5f0e8;
+      color: var(--text);
       line-height: 1.1;
     }
 
@@ -102,7 +90,7 @@
     .header-rule {
       width: 50px;
       height: 1px;
-      background: linear-gradient(90deg, transparent, var(--gold), transparent);
+      background: linear-gradient(90deg, transparent, var(--gold-deep), transparent);
       margin: 10px auto 0;
     }
 
@@ -111,11 +99,11 @@
       flex: 1;
       background: var(--surface);
       border: 1px solid var(--gold-border);
-      border-radius: 3px;
+      border-radius: 12px;
       display: flex;
       flex-direction: column;
       overflow: hidden;
-      box-shadow: 0 0 80px rgba(0,0,0,0.7), inset 0 1px 0 rgba(201,168,76,0.08);
+      box-shadow: 0 4px 24px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
       min-height: 0;
     }
 
@@ -128,13 +116,13 @@
       flex-direction: column;
       gap: 16px;
       scrollbar-width: thin;
-      scrollbar-color: #2a2010 transparent;
+      scrollbar-color: rgba(0,0,0,0.15) transparent;
       min-height: 0;
     }
 
     .messages::-webkit-scrollbar { width: 4px; }
     .messages::-webkit-scrollbar-track { background: transparent; }
-    .messages::-webkit-scrollbar-thumb { background: #2a2010; border-radius: 2px; }
+    .messages::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.15); border-radius: 2px; }
 
     /* Message row */
     .msg-row {
@@ -167,41 +155,41 @@
     }
 
     .avatar.assistant {
-      background: linear-gradient(135deg, #c9a84c 0%, #7a5a18 100%);
-      color: #fff;
+      background: linear-gradient(135deg, var(--gold) 0%, var(--gold-deep) 100%);
+      color: #1a1a1a;
     }
 
     .avatar.user {
       background: var(--user-bg);
       border: 1px solid var(--user-border);
-      color: #666;
+      color: #6b6359;
       font-size: 14px;
     }
 
     /* Bubble */
     .bubble {
       max-width: 80%;
-      padding: 11px 15px;
-      border-radius: 2px;
+      padding: 12px 16px;
+      border-radius: 10px;
       font-size: 14px;
       line-height: 1.7;
-      font-weight: 300;
+      font-weight: 400;
     }
 
     .bubble.assistant {
       background: var(--gold-dim);
-      border: 1px solid var(--gold-border);
+      border: 1px solid rgba(248,209,102,0.5);
       color: var(--text);
     }
 
     .bubble.user {
       background: var(--user-bg);
       border: 1px solid var(--user-border);
-      color: #a09080;
+      color: var(--text);
     }
 
     .bubble p { margin: 2px 0; }
-    .bubble strong { color: var(--gold); font-weight: 500; }
+    .bubble strong { color: var(--gold-deep); font-weight: 600; }
 
     /* Typing indicator */
     .typing {
@@ -232,9 +220,9 @@
     .booking-card {
       margin-top: 4px;
       padding: 14px 16px;
-      background: rgba(201,168,76,0.04);
-      border: 1px solid var(--gold-border);
-      border-radius: 2px;
+      background: rgba(248,209,102,0.10);
+      border: 1px solid rgba(248,209,102,0.45);
+      border-radius: 10px;
       font-size: 12px;
     }
 
@@ -242,9 +230,9 @@
       font-size: 9px;
       letter-spacing: 3px;
       text-transform: uppercase;
-      color: var(--gold);
+      color: var(--gold-deep);
       margin-bottom: 10px;
-      font-weight: 500;
+      font-weight: 600;
     }
 
     .booking-row {
@@ -254,12 +242,12 @@
     }
 
     .booking-label {
-      color: var(--text-muted);
+      color: var(--text-dim);
       min-width: 110px;
       text-transform: capitalize;
     }
 
-    .booking-value { color: #c8b87a; }
+    .booking-value { color: var(--text); font-weight: 500; }
 
     /* Status banner */
     .status-banner {
@@ -271,27 +259,27 @@
     }
 
     .status-banner.submitting {
-      background: rgba(201,168,76,0.08);
-      border: 1px solid rgba(201,168,76,0.25);
-      color: var(--gold);
+      background: rgba(248,209,102,0.15);
+      border: 1px solid rgba(248,209,102,0.45);
+      color: #8a6d1a;
     }
 
     .status-banner.success {
-      background: rgba(76,175,80,0.08);
-      border: 1px solid rgba(76,175,80,0.25);
-      color: #81c784;
+      background: rgba(76,175,80,0.10);
+      border: 1px solid rgba(76,175,80,0.30);
+      color: #2e7d32;
     }
 
     .status-banner.manual {
-      background: rgba(255,152,0,0.08);
-      border: 1px solid rgba(255,152,0,0.25);
-      color: #ffb74d;
+      background: rgba(255,152,0,0.10);
+      border: 1px solid rgba(255,152,0,0.35);
+      color: #c66900;
     }
 
     /* Divider */
     .divider {
       height: 1px;
-      background: var(--gold-border);
+      background: rgba(0,0,0,0.08);
       margin: 0 22px;
       flex-shrink: 0;
     }
@@ -307,42 +295,49 @@
 
     textarea {
       flex: 1;
-      background: rgba(255,255,255,0.02);
-      border: 1px solid rgba(201,168,76,0.18);
-      border-radius: 2px;
+      background: #fafaf8;
+      border: 1px solid rgba(0,0,0,0.10);
+      border-radius: 8px;
       padding: 10px 13px;
       color: var(--text);
       font-family: 'Jost', sans-serif;
       font-size: 14px;
-      font-weight: 300;
+      font-weight: 400;
       resize: none;
       outline: none;
       line-height: 1.5;
-      transition: border-color 0.2s;
+      transition: border-color 0.2s, box-shadow 0.2s;
       rows: 1;
     }
 
     textarea::placeholder { color: var(--text-muted); }
-    textarea:focus { border-color: rgba(201,168,76,0.45); }
+    textarea:focus {
+      border-color: var(--gold-deep);
+      box-shadow: 0 0 0 3px rgba(248,209,102,0.20);
+    }
 
     button#send {
-      background: linear-gradient(135deg, #c9a84c, #7a5818);
+      background: var(--gold);
       border: none;
-      border-radius: 2px;
+      border-radius: 999px;
       padding: 10px 22px;
-      color: #fff;
+      color: #1a1a1a;
       font-family: 'Jost', sans-serif;
       font-size: 13px;
-      font-weight: 400;
-      letter-spacing: 1px;
+      font-weight: 600;
+      letter-spacing: 0.5px;
       cursor: pointer;
-      transition: opacity 0.2s;
+      transition: background 0.2s, transform 0.1s;
       white-space: nowrap;
       flex-shrink: 0;
     }
 
+    button#send:hover:not(:disabled) {
+      background: var(--gold-deep);
+    }
+
     button#send:disabled {
-      opacity: 0.3;
+      opacity: 0.4;
       cursor: not-allowed;
     }
 
@@ -362,7 +357,7 @@
 <div class="wrapper">
 
   <div class="header">
-    <div class="header-eyebrow">White Glove Service · Sarasota, FL</div>
+    <div class="header-eyebrow">State-Wide Delivery · Sarasota, FL</div>
     <h1>Safe &amp; Sound</h1>
     <div class="header-sub">Delivery &amp; Moving</div>
     <div class="header-rule"></div>
