@@ -1,11 +1,5 @@
 {
   "rewrites": [
     { "source": "/", "destination": "/index.html" }
-  ],
-  "crons": [
-    {
-      "path": "/api/inbox",
-      "schedule": "*/5 * * * *"
-    }
   ]
 }
