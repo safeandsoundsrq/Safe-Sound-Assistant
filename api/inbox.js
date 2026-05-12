@@ -1,40 +1,25 @@
 // /api/inbox.js
 //
-// Cron-triggered endpoint that monitors safeandsound.sarasota@gmail.com for
-// inbound service inquiries and replies via the Safe & Sound assistant.
+// Cron-triggered endpoint that monitors safeandsound.sarasota@gmail.com and:
+//   - Replies to service inquiries via the Safe & Sound assistant.
+//   - Sorts obvious junk (promotions / vendor pitches / newsletters / auto
+//     notifications) into a separate "ai-cleanup" label and removes them from
+//     the inbox view. Nothing is deleted - the user can still find anything
+//     by searching the label.
+//   - Leaves important/personal mail untouched in the inbox (only labels it
+//     as "ai-handled" so we don't re-evaluate it).
 //
-// Flow per run:
-//   1. Fetch unread, inbox-only messages that aren't already labeled "ai-handled".
-//   2. For each thread, build the conversation history visible to us.
-//   3. Skip threads that don't look like service inquiries (auto-replies, vendors,
-//      threads where someone human already replied from our side).
-//   4. Hand the thread to Claude with the same system prompt as the chat assistant
-//      (with email-specific tweaks).
-//   5. Send the AI's reply on the thread.
-//   6. If Claude emitted BOOKING_DATA AND the estimated total is under the
-//      AUTOBOOK_LIMIT_USD threshold, also create a tentative calendar event
-//      and fire the existing confirmation email.
-//   7. Mark the source message as read and apply the "ai-handled" label so we
-//      don't process the same email twice.
-//
-// Required env vars (in addition to the ones api/email.js + api/calendar.js use):
-//   ANTHROPIC_API_KEY
-//   GOOGLE_CLIENT_ID
-//   GOOGLE_CLIENT_SECRET
-//   GOOGLE_REFRESH_TOKEN     <-- must now have gmail.modify scope (was gmail.send)
-//   OWNER_EMAIL              e.g. safeandsound.sarasota@gmail.com
-//   CRON_SECRET              random string; Vercel sends this in the Authorization header
-//   AUTOBOOK_LIMIT_USD       e.g. 500   (estimates at or under this auto-book)
-//   GOOGLE_CALENDAR_ID       (already used by api/calendar.js)
+// Required env vars (in addition to ANTHROPIC_API_KEY and Google OAuth):
+//   CRON_SECRET, AUTOBOOK_LIMIT_USD, OWNER_EMAIL, GOOGLE_CALENDAR_ID
 
 import { google } from "googleapis";
 
-const MAX_PER_RUN = 10;          // safety cap so a flood doesn't blow our budget
+const MAX_PER_RUN = 10;
 const MAX_AI_REPLIES_PER_THREAD = 6;
-const AI_LABEL_NAME = "ai-handled";
+const HANDLED_LABEL = "ai-handled";
+const CLEANUP_LABEL = "ai-cleanup";
 
 export default async function handler(req, res) {
-  // --- auth: only the Vercel cron (or you) can hit this ---
   const expected = `Bearer ${process.env.CRON_SECRET || ""}`;
   if (!process.env.CRON_SECRET || req.headers.authorization !== expected) {
     return res.status(401).json({ ok: false, error: "Unauthorized" });
@@ -42,13 +27,17 @@ export default async function handler(req, res) {
 
   try {
     const gmail = await gmailClient();
-    const labelId = await ensureLabel(gmail, AI_LABEL_NAME);
-    const candidates = await fetchUnhandled(gmail, labelId);
+    const handledLabelId = await ensureLabel(gmail, HANDLED_LABEL);
+    const cleanupLabelId = await ensureLabel(gmail, CLEANUP_LABEL);
+    const candidates = await fetchUnhandled(gmail);
 
     const summary = [];
     for (const msg of candidates.slice(0, MAX_PER_RUN)) {
       try {
-        const result = await processMessage(gmail, msg.id, labelId);
+        const result = await processMessage(gmail, msg.id, {
+          handledLabelId,
+          cleanupLabelId,
+        });
         summary.push({ id: msg.id, ...result });
       } catch (err) {
         console.error(`processMessage failed for ${msg.id}:`, err);
@@ -91,9 +80,8 @@ async function ensureLabel(gmail, name) {
   return created.data.id;
 }
 
-async function fetchUnhandled(gmail, labelId) {
-  // Query: unread, in inbox, not already handled by us, ignore drafts/sent.
-  const q = `is:unread in:inbox -label:${AI_LABEL_NAME} -from:me`;
+async function fetchUnhandled(gmail) {
+  const q = `is:unread in:inbox -label:${HANDLED_LABEL} -from:me`;
   const list = await gmail.users.messages.list({ userId: "me", q, maxResults: MAX_PER_RUN });
   return list.data.messages || [];
 }
@@ -102,7 +90,7 @@ async function fetchUnhandled(gmail, labelId) {
 // Per-message pipeline
 // =====================================================================
 
-async function processMessage(gmail, messageId, labelId) {
+async function processMessage(gmail, messageId, labels) {
   const msg = await gmail.users.messages.get({
     userId: "me",
     id: messageId,
@@ -114,43 +102,46 @@ async function processMessage(gmail, messageId, labelId) {
   const fromAddr = parseAddress(headers.from || "");
   const subject = headers.subject || "(no subject)";
 
-  // --- guardrails: skip auto-replies, mailer daemons, ourselves, threads we already replied to without a customer follow-up ---
-  if (looksAutomated(headers, msg.data)) {
-    await markHandled(gmail, messageId, labelId, "skipped: automated");
-    return { status: "skipped", reason: "automated", subject };
-  }
-
   if (sameAddress(fromAddr, process.env.OWNER_EMAIL)) {
-    await markHandled(gmail, messageId, labelId, "skipped: from owner");
+    await applyHandledLabel(gmail, messageId, labels.handledLabelId);
     return { status: "skipped", reason: "from owner", subject };
   }
 
-  // Fetch the whole thread so we have conversation context
+  // Automated mail still gets moved out of inbox (that's literally cleanup).
+  // We skip Claude to save tokens.
+  if (looksAutomated(headers, msg.data)) {
+    await moveToCleanup(gmail, messageId, labels);
+    return { status: "cleanup", reason: "automated/promotional headers", subject };
+  }
+
   const thread = await gmail.users.threads.get({ userId: "me", id: threadId, format: "full" });
   const conversation = thread.data.messages.map(messageToTurn).filter(Boolean);
 
-  // If the most recent thing in the thread isn't this customer email, skip.
-  // (A human at our end may have already replied, in which case we step out.)
   const lastTurn = conversation[conversation.length - 1];
   if (!lastTurn || lastTurn.role !== "user") {
-    await markHandled(gmail, messageId, labelId, "skipped: not the latest turn");
+    await applyHandledLabel(gmail, messageId, labels.handledLabelId);
     return { status: "skipped", reason: "not latest turn", subject };
   }
 
   const aiReplies = conversation.filter((t) => t.role === "assistant" && t.fromAi).length;
   if (aiReplies >= MAX_AI_REPLIES_PER_THREAD) {
-    await markHandled(gmail, messageId, labelId, "skipped: reply cap reached");
+    await applyHandledLabel(gmail, messageId, labels.handledLabelId);
     return { status: "skipped", reason: "reply cap", subject };
   }
 
-  // --- ask Claude ---
   const claude = await callClaude(conversation, { fromAddr, subject });
-  if (claude.classification === "not_inquiry") {
-    await markHandled(gmail, messageId, labelId, "skipped: not service inquiry");
-    return { status: "skipped", reason: "not inquiry", subject, classification: claude.classification };
+
+  if (claude.classification === "cleanup") {
+    await moveToCleanup(gmail, messageId, labels);
+    return { status: "cleanup", reason: "ai classified as cleanup", subject };
   }
 
-  // --- send the reply on this thread ---
+  if (claude.classification !== "service_inquiry") {
+    // "important" or unrecognized -> stay in inbox, just mark handled
+    await applyHandledLabel(gmail, messageId, labels.handledLabelId);
+    return { status: "skipped", reason: "not a service inquiry", subject, classification: claude.classification };
+  }
+
   const replyResult = await sendReply(gmail, {
     to: fromAddr,
     subject: subject.startsWith("Re:") ? subject : `Re: ${subject}`,
@@ -163,7 +154,6 @@ async function processMessage(gmail, messageId, labelId) {
     plainBody: claude.replyText,
   });
 
-  // --- conditional auto-book ---
   let bookingResult = null;
   if (claude.booking) {
     const limit = Number(process.env.AUTOBOOK_LIMIT_USD || 500);
@@ -175,7 +165,7 @@ async function processMessage(gmail, messageId, labelId) {
     }
   }
 
-  await markHandled(gmail, messageId, labelId, "handled");
+  await applyHandledLabel(gmail, messageId, labels.handledLabelId);
 
   return {
     status: "handled",
@@ -188,23 +178,33 @@ async function processMessage(gmail, messageId, labelId) {
 }
 
 // =====================================================================
-// Claude (email-mode system prompt)
+// Claude (email-mode system prompt with 3-way classification)
 // =====================================================================
 
-const EMAIL_PROMPT = `You are the email assistant for Safe and Sound Delivery & Moving — a high-end delivery and moving service offering State-Wide Delivery, based in Sarasota, FL. You answer customer email inquiries with the same warm, professional, polished tone the chat assistant uses.
+const EMAIL_PROMPT = `You are the email assistant for Safe and Sound Delivery & Moving - a high-end delivery and moving service offering State-Wide Delivery, based in Sarasota, FL. You answer customer email inquiries with the same warm, professional, polished tone the chat assistant uses.
 
 OPERATING CONTEXT:
 - You are reading and replying to real customer email. The customer cannot see structured booking JSON; only the body of your message is sent to them.
 - Keep replies tight: no markdown, no asterisks, no tables. Plain readable prose with simple labeled lines for any quote breakdown.
-- Sign off as "— The Safe & Sound team" (no individual name).
+- Sign off as "- The Safe & Sound team" (no individual name).
 - Always close estimates with the standard disclaimer that the figure is an estimate, not a fixed quote.
 
-FIRST DECISION (do this silently before anything else):
-Classify the email. Output one of:
-- service_inquiry — customer asking about delivery, moving, packing, junk removal, assembly, estate staging, or a quote / scheduling.
-- not_inquiry — vendor pitch, spam, personal correspondence, automated notification, or anything not asking for our service.
-Put the classification on its own first line, exactly:  CLASSIFICATION: service_inquiry  OR  CLASSIFICATION: not_inquiry
-After the classification line, leave a blank line, then write the customer-facing email body. If classification is not_inquiry, write nothing after that line.
+FIRST DECISION - CLASSIFY THE EMAIL (do this silently before anything else):
+Output exactly one of three classifications on the very first line:
+
+  CLASSIFICATION: service_inquiry
+  CLASSIFICATION: important
+  CLASSIFICATION: cleanup
+
+Use this rubric:
+- service_inquiry -> the sender is asking about delivery, moving, packing, junk removal, assembly, estate staging, a quote, a schedule, an availability, or otherwise needs our service. Includes both fresh leads and ongoing customer conversations.
+- cleanup -> promotional / marketing email the sender wasn't invited to, unsolicited vendor pitches trying to sell US a service or product, recurring newsletters, generic mass mail, automated subscription notifications (receipts for services we don't need to act on, app notifications, social network updates, "your weekly digest"-style mail). The defining test: would the owner be comfortable not seeing this in the main inbox?
+- important -> everything that isn't a service inquiry but is real correspondence we'd want visible: personal mail, mail from people the owner knows or works with, bills, banking, tax mail, government / school / .gov / .edu, mail referencing specific local addresses, real human-written mail even if borderline. WHEN IN DOUBT BETWEEN cleanup AND important, PICK important. We can always clean up later; we can't easily un-hide a mistakenly hidden important email.
+
+After the classification line, leave a blank line, then:
+- If service_inquiry -> write the customer-facing email body (instructions below).
+- If important -> write nothing else. Stop.
+- If cleanup -> write nothing else. Stop.
 
 SERVICES OFFERED:
 - Local Delivery (5 items or fewer)
@@ -213,17 +213,17 @@ SERVICES OFFERED:
 - Junk Removal
 - Assembly
 - Estate Staging
-- Storage Services — we organize / move items related to storage; we do NOT rent storage units.
+- Storage Services - we organize / move items related to storage; we do NOT rent storage units.
 
 BASE PRICING:
 - Base rate: $120/hr for a 2-person crew.
-- Distance surcharge: free under 20 miles, +$25 for 20–39 miles, +$50 for 40–59 miles, +$25 per additional 20 miles.
+- Distance surcharge: free under 20 miles, +$25 for 20-39 miles, +$50 for 40-59 miles, +$25 per additional 20 miles.
 - Stairs: +$20/hr per flight.
 - Weekend/holiday surcharge: +20% on the hourly rate.
 - Minimums: 1 hour for delivery, 3 hours for moves.
-- Hours: Mon–Fri 8am–4pm, Sat by appointment (surcharge applies), Sun closed.
+- Hours: Mon-Fri 8am-4pm, Sat by appointment (surcharge applies), Sun closed.
 
-DRIVE TIME: Always include round-trip drive time from origin (2255 N. Washington Blvd, Sarasota, FL 34234) → pickup → drop-off → origin. Estimate using your knowledge of Sarasota / Manatee / Charlotte county geography.
+DRIVE TIME: Always include round-trip drive time from origin (2255 N. Washington Blvd, Sarasota, FL 34234) -> pickup -> drop-off -> origin. Estimate using your knowledge of Sarasota / Manatee / Charlotte county geography.
 
 CONVERSATION FLOW (you are mid-thread; the email history is provided):
 1. If the customer hasn't given enough info, ask for what's missing in a friendly, concise way. Typical missing fields: name, service type, pickup address, drop-off address, item list, preferred date/time, stairs, contact phone.
@@ -232,14 +232,14 @@ CONVERSATION FLOW (you are mid-thread; the email history is provided):
 3. Then add: "Our team will review this and reach out shortly to confirm the details and finalize the quote."
 4. If you have all booking info AND the customer has confirmed they want to proceed, you may emit a BOOKING_DATA tag (instructions below). Otherwise do not.
 
-PHOTO POLICY: When photos would help (Packing, Full Service Moving, breakables, large jobs), warmly ask the customer to email photos to safeandsound.sarasota@gmail.com — explain it helps us bring the right truck size and crew. Note that the price reflects this photo-pending visibility.
+PHOTO POLICY: When photos would help (Packing, Full Service Moving, breakables, large jobs), warmly ask the customer to email photos to safeandsound.sarasota@gmail.com - explain it helps us bring the right truck size and crew. Note that the price reflects this photo-pending visibility.
 
 FULL-SERVICE MOVE RULES (truck sizing):
-- Up to ~2-bedroom move with standard furniture → 16' box truck (no rental fee).
-- Larger / oversized / many heavy pieces → 26' truck. Quote MUST add 1.5 hours of billable time AND a flat $130 truck rental fee.
+- Up to ~2-bedroom move with standard furniture -> 16' box truck (no rental fee).
+- Larger / oversized / many heavy pieces -> 26' truck. Quote MUST add 1.5 hours of billable time AND a flat $130 truck rental fee.
 
-ESTATE STAGING — collect: number of rooms, number of large items.
-PACKING — quote as a price RANGE on a separate line from the move itself. Always ask for photos of breakables.
+ESTATE STAGING - collect: number of rooms, number of large items.
+PACKING - quote as a price RANGE on a separate line from the move itself. Always ask for photos of breakables.
 
 DATE NORMALIZATION:
 - The CURRENT DATE is provided below. If the customer says "Saturday" or "next Tuesday", resolve it against that date.
@@ -248,8 +248,8 @@ DATE NORMALIZATION:
 
 BOOKING_DATA TAG (only when customer confirmed they want to book AND you have all required fields):
 At the very end of your reply (after the customer-facing prose), put this on its own line:
-BOOKING_DATA:{"name":"...","phone":"...","email":"...","service":"...","pickupAddress":"...","dropoffAddress":"...","date":"YYYY-MM-DD","time":"HH:MM","items":"...","stairs":"...","estimatedTotal":"$X – $Y","notes":"..."}
-The system will strip this line before the email is sent — the customer will never see it.`;
+BOOKING_DATA:{"name":"...","phone":"...","email":"...","service":"...","pickupAddress":"...","dropoffAddress":"...","date":"YYYY-MM-DD","time":"HH:MM","items":"...","stairs":"...","estimatedTotal":"$X - $Y","notes":"..."}
+The system will strip this line before the email is sent - the customer will never see it.`;
 
 async function callClaude(conversation, ctx) {
   const now = new Date();
@@ -266,8 +266,8 @@ async function callClaude(conversation, ctx) {
 - Today is ${friendly}.
 - ISO: ${iso}.
 - Timezone: America/New_York (Sarasota, FL).
-- Customer email address (for the BOOKING_DATA "email" field): ${ctx.fromAddr}
-- Subject of the latest customer message: ${ctx.subject}
+- Sender of the latest customer message: ${ctx.fromAddr}
+- Subject of the latest message: ${ctx.subject}
 
 `;
 
@@ -294,18 +294,16 @@ async function callClaude(conversation, ctx) {
   const data = await response.json();
   const raw = data.content?.[0]?.text || "";
 
-  // Parse classification line
-  const classMatch = raw.match(/^\s*CLASSIFICATION:\s*(\w+)/i);
-  const classification = classMatch ? classMatch[1].toLowerCase() : "service_inquiry";
+  const classMatch = raw.match(/^\s*CLASSIFICATION:\s*(service_inquiry|important|cleanup|not_inquiry)/i);
+  let classification = classMatch ? classMatch[1].toLowerCase() : "important";
+  if (classification === "not_inquiry") classification = "important";
 
-  // Parse booking tag
   const bookingMatch = raw.match(/BOOKING_DATA:(\{.*\})/);
   let booking = null;
   if (bookingMatch) {
     try { booking = JSON.parse(bookingMatch[1]); } catch { booking = null; }
   }
 
-  // Strip both classification and booking tag from what gets emailed
   let replyText = raw
     .replace(/^\s*CLASSIFICATION:\s*\w+\s*\n?/i, "")
     .replace(/BOOKING_DATA:\{.*\}/, "")
@@ -358,11 +356,25 @@ async function sendReply(gmail, opts) {
   return { id: result.data.id };
 }
 
-async function markHandled(gmail, messageId, labelId, _note) {
+async function applyHandledLabel(gmail, messageId, handledLabelId) {
   await gmail.users.messages.modify({
     userId: "me",
     id: messageId,
-    requestBody: { removeLabelIds: ["UNREAD"], addLabelIds: [labelId] },
+    requestBody: {
+      removeLabelIds: ["UNREAD"],
+      addLabelIds: [handledLabelId],
+    },
+  });
+}
+
+async function moveToCleanup(gmail, messageId, labels) {
+  await gmail.users.messages.modify({
+    userId: "me",
+    id: messageId,
+    requestBody: {
+      removeLabelIds: ["UNREAD", "INBOX"],
+      addLabelIds: [labels.handledLabelId, labels.cleanupLabelId],
+    },
   });
 }
 
@@ -371,8 +383,6 @@ async function markHandled(gmail, messageId, labelId, _note) {
 // =====================================================================
 
 async function internalCalendarAndConfirm(booking) {
-  // Re-use the same fetch shape as the chat widget. We hit our own routes so
-  // any future logic added to api/calendar or api/email applies uniformly.
   const base = process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "";
   const result = { calendar: null, email: null };
 
@@ -424,7 +434,9 @@ function looksAutomated(headers, msg) {
   if (headers["auto-submitted"] && headers["auto-submitted"] !== "no") return true;
   if (headers["x-autoreply"]) return true;
   if (headers["x-autorespond"]) return true;
-  if (headers["x-ss-bot"]) return true;                 // our own outgoing
+  if (headers["x-ss-bot"]) return true;
+  if (headers["list-unsubscribe"]) return true;
+  if (headers["list-id"]) return true;
   if (headers.precedence && /bulk|list|junk/i.test(headers.precedence)) return true;
   const from = (headers.from || "").toLowerCase();
   if (/mailer-daemon|no[-_]?reply|do[-_]?not[-_]?reply|notifications?@|postmaster/.test(from)) return true;
@@ -453,15 +465,12 @@ function extractPlainBody(payload) {
     return decodeBase64Url(payload.body.data);
   }
   if (payload.parts && payload.parts.length) {
-    // prefer text/plain
     const plain = payload.parts.find((p) => p.mimeType === "text/plain");
     if (plain?.body?.data) return decodeBase64Url(plain.body.data);
-    // recurse into multipart
     for (const p of payload.parts) {
       const inner = extractPlainBody(p);
       if (inner) return inner;
     }
-    // fallback: strip html
     const html = payload.parts.find((p) => p.mimeType === "text/html");
     if (html?.body?.data) {
       return decodeBase64Url(html.body.data)
@@ -482,8 +491,6 @@ function decodeBase64Url(s) {
 }
 
 function stripQuotedReply(body) {
-  // Cut everything below the first reply marker so Claude isn't re-reading
-  // the entire history every turn. Common markers from Gmail / iOS / Outlook.
   const cuts = [
     /^On .+ wrote:$/m,
     /^From: .+$/m,
@@ -500,7 +507,6 @@ function stripQuotedReply(body) {
 
 function parseLowDollar(estimatedTotal) {
   if (!estimatedTotal) return null;
-  // Pull the first dollar amount; supports "$300", "$300 – $450", "300-450", etc.
   const m = String(estimatedTotal).match(/\$?\s*(\d{2,5}(?:\.\d+)?)/);
   return m ? Number(m[1]) : null;
 }
