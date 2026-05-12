@@ -19,6 +19,23 @@ const MAX_AI_REPLIES_PER_THREAD = 6;
 const HANDLED_LABEL = "ai-handled";
 const CLEANUP_LABEL = "ai-cleanup";
 
+// Used only when Claude classifies an email as service_inquiry but fails to
+// write a body. Better to send a polite acknowledgment than an empty email.
+const SAFE_FALLBACK_REPLY = `Hi,
+
+Thank you for reaching out to Safe & Sound Delivery & Moving. We received your message and our team will review the details shortly.
+
+To help us put together an accurate quote, could you share a few details when you have a moment:
+- The service you need (delivery, moving, packing, junk removal, assembly, or estate staging)
+- Pickup address and drop-off address
+- A brief list or photos of the items involved
+- Your preferred date and time
+- A good phone number to reach you
+
+Feel free to email any photos to safeandsound.sarasota@gmail.com - they help us bring the right truck size and crew so the day goes smoothly.
+
+- The Safe & Sound team`;
+
 export default async function handler(req, res) {
   const expected = `Bearer ${process.env.CRON_SECRET || ""}`;
   if (!process.env.CRON_SECRET || req.headers.authorization !== expected) {
@@ -174,6 +191,7 @@ async function processMessage(gmail, messageId, labels) {
     aiClassification: claude.classification,
     replyId: replyResult.id,
     booking: bookingResult,
+    debug: claude.debug,
   };
 }
 
@@ -201,10 +219,10 @@ Use this rubric:
 - cleanup -> promotional / marketing email the sender wasn't invited to, unsolicited vendor pitches trying to sell US a service or product, recurring newsletters, generic mass mail, automated subscription notifications (receipts for services we don't need to act on, app notifications, social network updates, "your weekly digest"-style mail). The defining test: would the owner be comfortable not seeing this in the main inbox?
 - important -> everything that isn't a service inquiry but is real correspondence we'd want visible: personal mail, mail from people the owner knows or works with, bills, banking, tax mail, government / school / .gov / .edu, mail referencing specific local addresses, real human-written mail even if borderline. WHEN IN DOUBT BETWEEN cleanup AND important, PICK important. We can always clean up later; we can't easily un-hide a mistakenly hidden important email.
 
-After the classification line, leave a blank line, then:
-- If service_inquiry -> write the customer-facing email body (instructions below).
-- If important -> write nothing else. Stop.
-- If cleanup -> write nothing else. Stop.
+WHAT TO WRITE AFTER THE CLASSIFICATION LINE:
+- If classification is service_inquiry: leave a blank line, then write a COMPLETE customer-facing email body of at least one full paragraph. This is a hard requirement. NEVER leave the body empty. NEVER write only the classification line. Even if you cannot yet provide a quote because details are missing, write a warm acknowledgment that thanks the customer for reaching out and clearly asks for the specific information you still need (service type, addresses, item list, date/time, phone). The body is what gets sent to the customer - empty means the customer gets a blank email, which is unacceptable.
+- If classification is important: output only the classification line and nothing else.
+- If classification is cleanup: output only the classification line and nothing else.
 
 SERVICES OFFERED:
 - Local Delivery (5 items or fewer)
@@ -309,7 +327,28 @@ async function callClaude(conversation, ctx) {
     .replace(/BOOKING_DATA:\{.*\}/, "")
     .trim();
 
-  return { classification, booking, replyText };
+  // Diagnostic snapshot - included in the cron response so we can see what
+  // Claude actually produced when something looks off.
+  const debug = {
+    rawLen: raw.length,
+    replyLenBeforeFallback: replyText.length,
+    rawPreview: raw.slice(0, 200),
+    fallbackUsed: false,
+  };
+
+  // Safety net: Claude occasionally outputs only the classification line and
+  // forgets to write a body. If that happens on an inquiry, fall back to a
+  // safe generic acknowledgment rather than mailing the customer an empty
+  // message. The booking tag (if any) is still respected.
+  if (classification === "service_inquiry" && replyText.length < 30) {
+    console.warn("Empty reply body from Claude on service_inquiry. Using fallback. Raw length:", raw.length);
+    replyText = SAFE_FALLBACK_REPLY;
+    debug.fallbackUsed = true;
+  }
+
+  debug.replyLenFinal = replyText.length;
+
+  return { classification, booking, replyText, debug };
 }
 
 // =====================================================================
