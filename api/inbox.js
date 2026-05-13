@@ -151,14 +151,23 @@ async function processMessage(gmail, messageId, labels) {
     return { status: "skipped", reason: "reply cap", subject };
   }
 
-  const claude = await callClaude(conversation, { fromAddr, subject });
+  // If the AI has already replied in this thread, the customer's follow-up
+  // is by definition a continuation of an ongoing service inquiry. We force
+  // service_inquiry classification in that case so a fact-only reply (like
+  // "here are the addresses, my phone is X") never gets misclassified as
+  // 'important' and silently dropped.
+  const aiHasReplied = conversation.some((t) => t.role === "assistant" && t.fromAi);
 
-  if (claude.classification === "cleanup") {
+  const claude = await callClaude(conversation, { fromAddr, subject, aiHasReplied });
+
+  const effectiveClassification = aiHasReplied ? "service_inquiry" : claude.classification;
+
+  if (effectiveClassification === "cleanup") {
     await moveToCleanup(gmail, messageId, labels);
     return { status: "cleanup", reason: "ai classified as cleanup", subject };
   }
 
-  if (claude.classification !== "service_inquiry") {
+  if (effectiveClassification !== "service_inquiry") {
     // "important" or unrecognized -> stay in inbox, just mark handled
     await applyHandledLabel(gmail, messageId, labels.handledLabelId);
     return { status: "skipped", reason: "not a service inquiry", subject, classification: claude.classification };
@@ -220,7 +229,7 @@ Output exactly one of three classifications on the very first line:
   CLASSIFICATION: cleanup
 
 Use this rubric:
-- service_inquiry -> the sender is asking about delivery, moving, packing, junk removal, assembly, estate staging, a quote, a schedule, an availability, or otherwise needs our service. Includes both fresh leads and ongoing customer conversations.
+- service_inquiry -> the sender is asking about delivery, moving, packing, junk removal, assembly, estate staging, a quote, a schedule, an availability, or otherwise needs our service. Includes both fresh leads and ongoing customer conversations. CRITICAL: if there is ANY prior assistant message in this thread (a previous reply you or another agent sent), the customer's latest message is automatically a service_inquiry continuation - even if it's just bare facts like addresses, item lists, or "my phone is X". Customer follow-ups in an active thread are NEVER cleanup or important; they are always service_inquiry.
 - cleanup -> promotional / marketing email the sender wasn't invited to, unsolicited vendor pitches trying to sell US a service or product, recurring newsletters, generic mass mail, automated subscription notifications (receipts for services we don't need to act on, app notifications, social network updates, "your weekly digest"-style mail). The defining test: would the owner be comfortable not seeing this in the main inbox?
 - important -> everything that isn't a service inquiry but is real correspondence we'd want visible: personal mail, mail from people the owner knows or works with, bills, banking, tax mail, government / school / .gov / .edu, mail referencing specific local addresses, real human-written mail even if borderline. WHEN IN DOUBT BETWEEN cleanup AND important, PICK important. We can always clean up later; we can't easily un-hide a mistakenly hidden important email.
 
