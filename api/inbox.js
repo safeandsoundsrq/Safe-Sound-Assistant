@@ -8,6 +8,8 @@
 //     by searching the label.
 //   - Leaves important/personal mail untouched in the inbox (only labels it
 //     as "ai-handled" so we don't re-evaluate it).
+//   - Stops replying to a thread once the owner has personally taken over.
+//   - Never engages with senders matching BLOCKED_SENDER_PATTERNS.
 //
 // Required env vars (in addition to ANTHROPIC_API_KEY and Google OAuth):
 //   CRON_SECRET, AUTOBOOK_LIMIT_USD, OWNER_EMAIL, GOOGLE_CALENDAR_ID
@@ -19,6 +21,19 @@ const MAX_PER_RUN = 10;
 const MAX_AI_REPLIES_PER_THREAD = 6;
 const HANDLED_LABEL = "ai-handled";
 const CLEANUP_LABEL = "ai-cleanup";
+
+// Senders the assistant will NEVER respond to. Case-insensitive regex on the
+// From header (covers local part, domain, and display name). To block another
+// sender later, add a new pattern below. Matched messages are silently marked
+// ai-handled and left in the inbox - they're not deleted or moved.
+const BLOCKED_SENDER_PATTERNS = [
+  /estate1520/i,  // Estate1520 invite / calendar mail - do not auto-reply
+];
+
+function isBlockedSender(headers) {
+  const from = (headers.from || "").toLowerCase();
+  return BLOCKED_SENDER_PATTERNS.some((re) => re.test(from));
+}
 
 // Used only when Claude classifies an email as service_inquiry but fails to
 // write a body. Better to send a polite acknowledgment than an empty email.
@@ -129,6 +144,12 @@ async function processMessage(gmail, messageId, labels) {
     return { status: "skipped", reason: "from owner", subject };
   }
 
+  // Hard blocklist - never engage with these senders, no matter what.
+  if (isBlockedSender(headers)) {
+    await applyHandledLabel(gmail, messageId, labels.handledLabelId);
+    return { status: "skipped", reason: "blocked sender", subject, from: fromAddr };
+  }
+
   // Automated mail still gets moved out of inbox (that's literally cleanup).
   // We skip Claude to save tokens.
   if (looksAutomated(headers, msg.data)) {
@@ -143,6 +164,16 @@ async function processMessage(gmail, messageId, labels) {
   if (!lastTurn || lastTurn.role !== "user") {
     await applyHandledLabel(gmail, messageId, labels.handledLabelId);
     return { status: "skipped", reason: "not latest turn", subject };
+  }
+
+  // If the owner has personally replied in this thread (assistant role but
+  // WITHOUT the X-SS-Bot marker we add to our outgoing AI mail), they have
+  // taken over the conversation. The assistant must stop replying so it
+  // doesn't talk over a human handling the customer directly.
+  const ownerHasTakenOver = conversation.some((t) => t.role === "assistant" && !t.fromAi);
+  if (ownerHasTakenOver) {
+    await applyHandledLabel(gmail, messageId, labels.handledLabelId);
+    return { status: "skipped", reason: "owner has taken over thread", subject };
   }
 
   const aiReplies = conversation.filter((t) => t.role === "assistant" && t.fromAi).length;
